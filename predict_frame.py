@@ -1,501 +1,379 @@
 import numpy as np
 
+
 def compute_ssd(block1, block2):
     """
-    calculate SSD (Sum of Squared Differences) between two blocks 
-    
-    :param block1: block of current frame
-    :param block2: Candidate blocks for the reference frame
-    :return: SSD value
+    Sum of Squared Differences between two blocks.
+
+    :param block1:  block from current frame
+    :param block2:  candidate block from reference frame
+    :return:  SSD value
     """
-    # ensure two blocks are of equel size 
-    assert block1.shape == block2.shape, "Blocks must have the same size"
-    
-    # convert to int32 to prevent overflow, then calculate the sum of the squares of the differences
     diff = block1.astype(np.int32) - block2.astype(np.int32)
-    ssd = np.sum(diff ** 2)
-    
-    return ssd
+    return int(np.sum(diff * diff))
+
 
 def compute_sad(block1, block2):
     """
-    Compute Sum of Absolute Differences (SAD)
-    
+    Sum of Absolute Differences between two blocks.
+
     :param block1: block from current frame
     :param block2: candidate block from reference frame
-    :return: SAD value
+    :return:  SAD value
     """
-    assert block1.shape == block2.shape, "Blocks must have the same size"
-    diff = block1.astype(np.int32) - block2.astype(np.int32)
-    sad = np.sum(np.abs(diff))
-    return sad
+    return int(np.sum(np.abs(block1.astype(np.int32) - block2.astype(np.int32))))
 
 
-def motion_estimation(cur_frame, ref_frame, blocksize, search_range, distance_metric='ssd'):
+def motion_estimation(cur_frame, ref_frame, blocksize, search_range,
+                      distance_metric='ssd'):
     """
-    Block matching motion estimation
+    Full-search block matching (luminance only).
+    For each block, all candidates in the search window are evaluated in one
+    vectorised numpy operation.
 
     :param cur_frame: current frame to be predicted
     :param ref_frame: reference frame (previous frame)
-    :param blocksize: block size (e.g., 4x4)
-    :param search_range: search range (±search_range pixels)
-    :param distance_metric: 'ssd' or 'sad' (default: 'ssd')
-    :return: mvs - motion vector array
+    :param blocksize: side length of each square block in pixels (e.g. 4)
+    :param search_range: maximum displacement in ±pixels (e.g. 16)
+    :param distance_metric: 'ssd' or 'sad'
+    :return: mvs  motion vectors [dm, dn] per block
     """
     height, width = cur_frame.shape
-    num_blocks_h = height // blocksize
-    num_blocks_w = width // blocksize
+    B  = blocksize
+    sr = search_range
+
+    num_blocks_h = height // B
+    num_blocks_w = width  // B
     mvs = np.zeros((num_blocks_h, num_blocks_w, 2), dtype=np.int32)
-    
-    # Pre-calculate search range boundaries to avoid repeated if-statements
-    # This loop iterates over blocks, which is much fewer than iterating over pixels
+
+    cur_f = cur_frame.astype(np.int32)
+    ref_f = ref_frame.astype(np.int32)
+
     for i in range(num_blocks_h):
+        y = i * B
         for j in range(num_blocks_w):
-            cur_y = i * blocksize
-            cur_x = j * blocksize
-            cur_block = cur_frame[cur_y:cur_y+blocksize, cur_x:cur_x+blocksize].astype(np.int32)
-            
-            # Determine the valid search boundaries for the current block
-            win_y_min = max(0, cur_y - search_range)
-            win_y_max = min(height - blocksize, cur_y + search_range)
-            win_x_min = max(0, cur_x - search_range)
-            win_x_max = min(width - blocksize, cur_x + search_range)
-            
-            best_distance = np.inf
-            best_dm = 0
-            best_dn = 0
-            
-            # --- Vectorization  ---
-            for dn in range(win_y_min - cur_y, win_y_max - cur_y + 1):
-                # Extract the entire row of candidate blocks for this vertical offset
-                ref_y = cur_y + dn
-                
-                for dm in range(win_x_min - cur_x, win_x_max - cur_x + 1):
-                    ref_x = cur_x + dm
-                    
-                    # Get candidate block from reference frame
-                    ref_block = ref_frame[ref_y:ref_y+blocksize, ref_x:ref_x+blocksize].astype(np.int32)
-                    
-                    # Calculate distance based on metric
-                    if distance_metric == 'ssd':
-                        # Manual inline SSD is faster than calling compute_ssd function 
-                        diff = cur_block - ref_block
-                        distance = np.sum(diff * diff)
-                    else:
-                        # SAD calculation
-                        distance = np.sum(np.abs(cur_block - ref_block))
-                    
-                    # Update best match
-                    if distance < best_distance:
-                        best_distance = distance
-                        best_dm = dm
-                        best_dn = dn
-            
-            mvs[i, j, 0] = best_dm
-            mvs[i, j, 1] = best_dn
-            
+            x = j * B
+
+            dy_min = max(0,          y - sr)
+            dy_max = min(height - B, y + sr)
+            dx_min = max(0,          x - sr)
+            dx_max = min(width  - B, x + sr)
+
+            n_dy = dy_max - dy_min + 1
+            n_dx = dx_max - dx_min + 1
+
+            # Build (n_dy, n_dx, B, B) candidate array via advanced indexing
+            row_idx = (np.arange(n_dy)[:, None, None, None] + dy_min
+                       + np.arange(B)[None, None, :, None])
+            col_idx = (np.arange(n_dx)[None, :, None, None] + dx_min
+                       + np.arange(B)[None, None, None, :])
+
+            candidates = ref_f[row_idx, col_idx]       # (n_dy, n_dx, B, B)
+            cur_block  = cur_f[y:y+B, x:x+B]           # (B, B)
+            diff       = cur_block - candidates         # broadcast -> (n_dy, n_dx, B, B)
+
+            if distance_metric == 'ssd':
+                costs = np.sum(diff * diff, axis=(2, 3))
+            else:
+                costs = np.sum(np.abs(diff), axis=(2, 3))
+
+            flat_idx         = np.argmin(costs)
+            best_dn, best_dm = np.unravel_index(flat_idx, costs.shape)
+
+            mvs[i, j, 0] = (dx_min + best_dm) - x   # horizontal displacement dm
+            mvs[i, j, 1] = (dy_min + best_dn) - y   # vertical   displacement dn
+
     return mvs
 
-def motion_compensation(ref_frame, blocksize, mvs):
-    # TODO: implement motion compensation
 
+def motion_compensation(ref_frame, blocksize, mvs):
     """
-    Motion compensation: generate predicted frame from reference frame using motion vectors
-    
-    :param ref_frame: reference frame
-    :param blocksize: block size
-    :param mvs: motion vector array
-    :return: pred_frame - predicted frame
+    Generate predicted frame by copying blocks from the reference frame
+    according to the motion vectors.
+
+    :param ref_frame:  reference frame
+    :param blocksize:  block side length in pixels
+    :param mvs:        motion vectors [dm, dn]
+    :return:           predicted frame
     """
-    height, width = ref_frame.shape
+    height, width          = ref_frame.shape
+    B                      = blocksize
     num_blocks_h, num_blocks_w = mvs.shape[:2]
-    
-    # Initialize predicted frame
     pred_frame = np.zeros((height, width), dtype=np.uint8)
-    
-    # Perform compensation for each block
+
     for i in range(num_blocks_h):
         for j in range(num_blocks_w):
-            # Position of current block in predicted frame
-            cur_y = i * blocksize
-            cur_x = j * blocksize
-            
-            # Get motion vector for this block
-            dm = mvs[i, j, 0]
-            dn = mvs[i, j, 1]
-            
-            # Calculate position of corresponding block in reference frame
-            ref_y = cur_y + dn
-            ref_x = cur_x + dm
+            y, x   = i * B, j * B
+            dm, dn = int(mvs[i, j, 0]), int(mvs[i, j, 1])
+            pred_frame[y:y+B, x:x+B] = ref_frame[y+dn:y+dn+B, x+dm:x+dm+B]
 
-            # Copy corresponding block from reference frame to predicted frame
-            pred_frame[cur_y:cur_y+blocksize, cur_x:cur_x+blocksize] = \
-                ref_frame[ref_y:ref_y+blocksize, ref_x:ref_x+blocksize]
-            
     return pred_frame
 
-def predict_frame(cur_frame, ref_frame, blocksize, search_range, distance_metric='ssd'):
+
+def predict_frame(cur_frame, ref_frame, blocksize, search_range,
+                  distance_metric='ssd'):
     """
-    Main function for prediction
-    
-    :param cur_frame: current frame to be predicted
-    :param ref_frame: reference frame (previous frame)
-    :param blocksize: block size
-    :param search_range: search range
-    :param distance_metric: 'ssd' or 'sad' (default: 'ssd')
+    Full-search motion-compensated prediction for one frame.
+
+    :param cur_frame: frame to be predicted
+    :param ref_frame: previous frame used as reference
+    :param blocksize: block side length in pixels (e.g. 4)
+    :param search_range: search window half-size in pixels (e.g. 16)
+    :param distance_metric: 'ssd' or 'sad'
     :return: predicted frame
     """
-    mvs = motion_estimation(cur_frame, ref_frame, blocksize, search_range, distance_metric)
-    pred_frame = motion_compensation(ref_frame, blocksize, mvs)
-    return pred_frame
+    mvs  = motion_estimation(cur_frame, ref_frame, blocksize,
+                             search_range, distance_metric)
+    pred = motion_compensation(ref_frame, blocksize, mvs)
+    return pred
 
-def motion_estimation_three_step(cur_frame, ref_frame, blocksize, search_range, distance_metric='ssd'):
+
+def motion_estimation_three_step(cur_frame, ref_frame, blocksize, search_range,
+                                 distance_metric='ssd'):
     """
-    Three Step Search motion estimation algorithm
-    
-    :param cur_frame: current frame to be predicted
-    :param ref_frame: reference frame (previous frame)
-    :param blocksize: block size (e.g., 4x4)
-    :param search_range: maximum search range (±search_range pixels)
-    :param distance_metric: 'ssd' or 'sad' (default: 'ssd')
-    :return: mvs - motion vector array, search_positions - number of positions searched
+    Three-Step Search (TSS) block matching.
+    Step size starts at the largest power-of-2 <= search_range and halves
+    each iteration; 8 neighbours are tested per step.
+
+    :param cur_frame: current frame
+    :param ref_frame: reference frame
+    :param blocksize: block side length in pixels
+    :param search_range: maximum search displacement in +-pixels
+    :param distance_metric: 'ssd' or 'sad'
+    :return: mvs motion vectors [dm, dn] 
+             total_positions total number of candidate positions evaluated
     """
+    import math
     height, width = cur_frame.shape
-    num_blocks_h = height // blocksize
-    num_blocks_w = width // blocksize
-    mvs = np.zeros((num_blocks_h, num_blocks_w, 2), dtype=np.int32)
-    
-    # Select distance function
-    if distance_metric == 'ssd':
-        distance_func = compute_ssd
-    elif distance_metric == 'sad':
-        distance_func = compute_sad
-    else:
-        raise ValueError(f"Unknown distance metric: {distance_metric}")
-    
-    # Count total search positions
-    total_search_positions = 0
-    
+    B  = blocksize
+    sr = search_range
+
+    num_blocks_h = height // B
+    num_blocks_w = width  // B
+    mvs          = np.zeros((num_blocks_h, num_blocks_w, 2), dtype=np.int32)
+
+    dist_fn   = compute_ssd if distance_metric == 'ssd' else compute_sad
+    init_step = 1 << (int(math.log2(sr)) if sr >= 1 else 0)
+
+    total_positions = 0
+
     for i in range(num_blocks_h):
         for j in range(num_blocks_w):
-            cur_y = i * blocksize
-            cur_x = j * blocksize
-            cur_block = cur_frame[cur_y:cur_y+blocksize, cur_x:cur_x+blocksize]
-            
-            # Three Step Search Algorithm
-            # Step size starts at search_range//2 and halves each iteration
-            step_size = max(search_range // 2, 1)
-            
-            # Start at center position (0, 0)
-            center_dm = 0
-            center_dn = 0
-            
-            # Initialize best match at center
-            ref_y = cur_y + center_dn
-            ref_x = cur_x + center_dm
-            
-            if (ref_y >= 0 and ref_y + blocksize <= height and
-                ref_x >= 0 and ref_x + blocksize <= width):
-                ref_block = ref_frame[ref_y:ref_y+blocksize, ref_x:ref_x+blocksize]
-                best_distance = distance_func(cur_block, ref_block)
-            else:
-                best_distance = np.inf
-            
-            best_dm = center_dm
-            best_dn = center_dn
-            total_search_positions += 1
-            
-            # Three step search iterations
-            while step_size >= 1:
-                # Test 8 neighboring points around current center
-                found_better = False
-                
-                for dn_offset in [-step_size, 0, step_size]:
-                    for dm_offset in [-step_size, 0, step_size]:
-                        # Skip center point (already checked)
-                        if dn_offset == 0 and dm_offset == 0:
+            y, x      = i * B, j * B
+            cur_block = cur_frame[y:y+B, x:x+B]
+
+            cy, cx    = 0, 0
+            best_dist = dist_fn(cur_block, ref_frame[y:y+B, x:x+B])
+            total_positions += 1
+
+            step = init_step
+            while step >= 1:
+                best_dn, best_dm = cy, cx
+                for dn in (-step, 0, step):
+                    for dm in (-step, 0, step):
+                        if dn == 0 and dm == 0:
                             continue
-                        
-                        test_dn = center_dn + dn_offset
-                        test_dm = center_dm + dm_offset
-                        
-                        # Check if within search range
-                        if abs(test_dn) > search_range or abs(test_dm) > search_range:
+                        ty, tx = cy + dn, cx + dm
+                        if abs(ty) > sr or abs(tx) > sr:
                             continue
-                        
-                        ref_y = cur_y + test_dn
-                        ref_x = cur_x + test_dm
-                        
-                        # Boundary check
-                        if (ref_y >= 0 and ref_y + blocksize <= height and
-                            ref_x >= 0 and ref_x + blocksize <= width):
-                            
-                            ref_block = ref_frame[ref_y:ref_y+blocksize, 
-                                                 ref_x:ref_x+blocksize]
-                            distance = distance_func(cur_block, ref_block)
-                            total_search_positions += 1
-                            
-                            if distance < best_distance:
-                                best_distance = distance
-                                best_dm = test_dm
-                                best_dn = test_dn
-                                found_better = True
-                
-                # Move center to best position found
-                center_dm = best_dm
-                center_dn = best_dn
-                
-                # Reduce step size
-                step_size = step_size // 2
-            
-            # Save best motion vector
-            mvs[i, j, 0] = best_dm
-            mvs[i, j, 1] = best_dn
-    
-    return mvs, total_search_positions
+                        ry, rx = y + ty, x + tx
+                        if ry < 0 or ry+B > height or rx < 0 or rx+B > width:
+                            continue
+                        d = dist_fn(cur_block, ref_frame[ry:ry+B, rx:rx+B])
+                        total_positions += 1
+                        if d < best_dist:
+                            best_dist        = d
+                            best_dn, best_dm = ty, tx
+                cy, cx = best_dn, best_dm
+                step >>= 1
+
+            mvs[i, j, 0] = cx   # dm
+            mvs[i, j, 1] = cy   # dn
+
+    return mvs, total_positions
 
 
-def predict_frame_three_step(cur_frame, ref_frame, blocksize, search_range, distance_metric='ssd'):
+def predict_frame_three_step(cur_frame, ref_frame, blocksize, search_range,
+                             distance_metric='ssd'):
     """
-    Prediction using Three Step Search
-    
-    :param cur_frame: current frame to be predicted
+    Motion-compensated prediction using Three-Step Search.
+
+    :param cur_frame: frame to be predicted
     :param ref_frame: reference frame
-    :param blocksize: block size
-    :param search_range: search range
+    :param blocksize: block side length in pixels
+    :param search_range: maximum search displacement in +-pixels
     :param distance_metric: 'ssd' or 'sad'
-    :return: predicted frame, number of search positions
+    :return: pred_frame      predicted frame
+             positions       total candidate positions evaluated
     """
-    mvs, search_positions = motion_estimation_three_step(cur_frame, ref_frame, 
-                                                         blocksize, search_range, 
-                                                         distance_metric)
-    pred_frame = motion_compensation(ref_frame, blocksize, mvs)
-    return pred_frame, search_positions
+    mvs, positions = motion_estimation_three_step(
+        cur_frame, ref_frame, blocksize, search_range, distance_metric)
+    pred = motion_compensation(ref_frame, blocksize, mvs)
+    return pred, positions
+
 
 def interpolate_half_pixel(frame):
     """
-    Interpolate frame to half-pixel positions using bilinear interpolation
-    Creates a frame with 2x resolution (half-pixel grid)
-    
-    :param frame: original frame (height x width)
-    :return: interpolated frame with half-pixel positions (2*height-1 x 2*width-1)
+    Bilinear half-pixel interpolation.
+    Integer-pixel samples are kept in place; half-pixel positions are
+    filled by averaging their integer-pixel neighbours.
+
+    :param frame: original frame
+    :return:      half-pixel grid
+                  even rows/cols = original samples
+                  odd  cols only = horizontal half-pixels  a = (A+B+1)>>1
+                  odd  rows only = vertical   half-pixels  b = (A+C+1)>>1
+                  odd  rows+cols = diagonal   half-pixels  e = (A+B+C+D+2)>>2
     """
-    h, w = frame.shape
     f = frame.astype(np.int32)
-    interp = np.zeros((2 * h - 1, 2 * w - 1), dtype=np.float32)
+    h, w = f.shape
+    out = np.empty((2*h - 1, 2*w - 1), dtype=np.float32)
 
-    # Integer positions
-    interp[::2, ::2] = f
-
-    # Horizontal: a = (A + B + 1) >> 1
-    interp[::2, 1::2] = (f[:, :-1] + f[:, 1:] + 1) >> 1
-
-    # Vertical: b = (A + C + 1) >> 1
-    interp[1::2, ::2] = (f[:-1, :] + f[1:, :] + 1) >> 1
-
-    # Diagonal: e = (A + B + C + D + 2) >> 2
-    interp[1::2, 1::2] = (f[:-1, :-1] + f[:-1, 1:] + f[1:, :-1] + f[1:, 1:] + 2) >> 2
-
-    return interp
+    out[::2,  ::2]  = f
+    out[::2,  1::2] = (f[:, :-1] + f[:, 1:]  + 1) >> 1
+    out[1::2, ::2]  = (f[:-1, :] + f[1:, :]  + 1) >> 1
+    out[1::2, 1::2] = (f[:-1, :-1] + f[:-1, 1:]
+                       + f[1:, :-1] + f[1:, 1:] + 2) >> 2
+    return out
 
 
-def motion_estimation_half_pixel(cur_frame, ref_frame, blocksize, search_range, 
-                                  use_three_step=True, distance_metric='ssd'):
+def motion_estimation_half_pixel(cur_frame, ref_frame, blocksize, search_range,
+                                 use_three_step=True, distance_metric='ssd'):
     """
-    Motion estimation with half-pixel accuracy
-    
+    Two-stage half-pixel motion estimation.
+    Stage 1: integer-pixel search (three-step or full search).
+    Stage 2: tests the 8 half-pixel neighbours
+             around the integer best match.
+
     :param cur_frame: current frame
     :param ref_frame: reference frame
-    :param blocksize: block size
-    :param search_range: search range (in integer pixels)
-    :param use_three_step: use three-step search (True) or full search (False)
+    :param blocksize: block side length in pixels
+    :param search_range: integer-pixel search range in +-pixels
+    :param use_three_step: True = TSS for Stage 1, False = full search
     :param distance_metric: 'ssd' or 'sad'
-    :return: mvs - motion vectors with half-pixel accuracy (in half-pixel units)
+    :return: mvs  motion vectors in pixel units
+                  (multiples of 0.5; e.g. 1.5 means one-and-a-half pixels)
     """
+    import math
     height, width = cur_frame.shape
-    num_blocks_h = height // blocksize
-    num_blocks_w = width // blocksize
-    
-    # Motion vectors in half-pixel units (multiply by 2 for half-pixel grid)
-    mvs = np.zeros((num_blocks_h, num_blocks_w, 2), dtype=np.float32)
-    
-    # Interpolate reference frame to half-pixel positions
-    ref_frame_interp = interpolate_half_pixel(ref_frame)
-    
-    # Select distance function
-    if distance_metric == 'ssd':
-        distance_func = compute_ssd
-    elif distance_metric == 'sad':
-        distance_func = compute_sad
-    else:
-        raise ValueError(f"Unknown distance metric: {distance_metric}")
-    
-    # Process each block
+    B  = blocksize
+    sr = search_range
+
+    num_blocks_h = height // B
+    num_blocks_w = width  // B
+    mvs          = np.zeros((num_blocks_h, num_blocks_w, 2), dtype=np.float32)
+
+    ref_interp = interpolate_half_pixel(ref_frame)   # computed once, reused per block
+    dist_fn    = compute_ssd if distance_metric == 'ssd' else compute_sad
+
     for i in range(num_blocks_h):
         for j in range(num_blocks_w):
-            cur_y = i * blocksize
-            cur_x = j * blocksize
-            cur_block = cur_frame[cur_y:cur_y+blocksize, cur_x:cur_x+blocksize]
-            
-            best_distance = np.inf
-            best_mv_y = 0.0
-            best_mv_x = 0.0
-            
+            y, x      = i * B, j * B
+            cur_block = cur_frame[y:y+B, x:x+B]
+
+            # Stage 1: integer-pixel search
             if use_three_step:
-                # Step 1: Integer-pixel search using three-step search
-                step_size = max(search_range // 2, 1)
-                center_y = 0
-                center_x = 0
-                
-                # Test center first
-                ref_y = cur_y + center_y
-                ref_x = cur_x + center_x
-                if (ref_y >= 0 and ref_y + blocksize <= height and
-                    ref_x >= 0 and ref_x + blocksize <= width):
-                    ref_block = ref_frame[ref_y:ref_y+blocksize, ref_x:ref_x+blocksize]
-                    best_distance = distance_func(cur_block, ref_block)
-                    best_mv_y = center_y
-                    best_mv_x = center_x
-                
-                # Three-step search at integer positions
-                while step_size >= 1:
-                    for dy in [-step_size, 0, step_size]:
-                        for dx in [-step_size, 0, step_size]:
-                            if dy == 0 and dx == 0:
+                init_step = 1 << (int(math.log2(sr)) if sr >= 1 else 0)
+                cy, cx    = 0, 0
+                best_dist = dist_fn(cur_block, ref_frame[y:y+B, x:x+B])
+                step      = init_step
+                while step >= 1:
+                    best_dn, best_dm = cy, cx
+                    for dn in (-step, 0, step):
+                        for dm in (-step, 0, step):
+                            if dn == 0 and dm == 0:
                                 continue
-                            
-                            test_y = center_y + dy
-                            test_x = center_x + dx
-                            
-                            if abs(test_y) > search_range or abs(test_x) > search_range:
+                            ty, tx = cy + dn, cx + dm
+                            if abs(ty) > sr or abs(tx) > sr:
                                 continue
-                            
-                            ref_y = cur_y + test_y
-                            ref_x = cur_x + test_x
-                            
-                            if (ref_y >= 0 and ref_y + blocksize <= height and
-                                ref_x >= 0 and ref_x + blocksize <= width):
-                                ref_block = ref_frame[ref_y:ref_y+blocksize, 
-                                                     ref_x:ref_x+blocksize]
-                                distance = distance_func(cur_block, ref_block)
-                                
-                                if distance < best_distance:
-                                    best_distance = distance
-                                    best_mv_y = test_y
-                                    best_mv_x = test_x
-                    
-                    center_y = best_mv_y
-                    center_x = best_mv_x
-                    step_size = step_size // 2
-                
-                # Step 2: Half-pixel refinement around best integer position
-                # Search 8 half-pixel positions around best integer match
-                integer_mv_y = int(best_mv_y)
-                integer_mv_x = int(best_mv_x)
-                
-                for dy_half in [-0.5, 0.0, 0.5]:
-                    for dx_half in [-0.5, 0.0, 0.5]:
-                        if dy_half == 0.0 and dx_half == 0.0:
-                            continue  # Already tested
-                        
-                        test_mv_y = integer_mv_y + dy_half
-                        test_mv_x = integer_mv_x + dx_half
-                        
-                        # Position in interpolated frame (half-pixel grid)
-                        ref_y_interp = int((cur_y + test_mv_y) * 2)
-                        ref_x_interp = int((cur_x + test_mv_x) * 2)
-                        
-                        # Check bounds
-                        if (ref_y_interp >= 0 and ref_y_interp + blocksize * 2 <= ref_frame_interp.shape[0] and
-                            ref_x_interp >= 0 and ref_x_interp + blocksize * 2 <= ref_frame_interp.shape[1]):
-                            
-                            # Extract block from interpolated frame (every 2nd pixel)
-                            ref_block = ref_frame_interp[ref_y_interp:ref_y_interp+blocksize*2:2,
-                                                        ref_x_interp:ref_x_interp+blocksize*2:2]
-                            
-                            if ref_block.shape == cur_block.shape:
-                                distance = distance_func(cur_block, ref_block.astype(np.uint8))
-                                
-                                if distance < best_distance:
-                                    best_distance = distance
-                                    best_mv_y = test_mv_y
-                                    best_mv_x = test_mv_x
-            
+                            ry, rx = y + ty, x + tx
+                            if ry < 0 or ry+B > height or rx < 0 or rx+B > width:
+                                continue
+                            d = dist_fn(cur_block, ref_frame[ry:ry+B, rx:rx+B])
+                            if d < best_dist:
+                                best_dist        = d
+                                best_dn, best_dm = ty, tx
+                    cy, cx = best_dn, best_dm
+                    step >>= 1
+                int_dn, int_dm = cy, cx
             else:
-                # Full search at integer and half-pixel positions
-                for dy in range(-search_range, search_range + 1):
-                    for dx in range(-search_range, search_range + 1):
-                        for dy_half in [0.0, 0.5]:
-                            for dx_half in [0.0, 0.5]:
-                                test_mv_y = dy + dy_half
-                                test_mv_x = dx + dx_half
-                                
-                                ref_y_interp = int((cur_y + test_mv_y) * 2)
-                                ref_x_interp = int((cur_x + test_mv_x) * 2)
-                                
-                                if (ref_y_interp >= 0 and ref_y_interp + blocksize * 2 <= ref_frame_interp.shape[0] and
-                                    ref_x_interp >= 0 and ref_x_interp + blocksize * 2 <= ref_frame_interp.shape[1]):
-                                    
-                                    ref_block = ref_frame_interp[ref_y_interp:ref_y_interp+blocksize*2:2,
-                                                                ref_x_interp:ref_x_interp+blocksize*2:2]
-                                    
-                                    if ref_block.shape == cur_block.shape:
-                                        distance = distance_func(cur_block, ref_block.astype(np.uint8))
-                                        
-                                        if distance < best_distance:
-                                            best_distance = distance
-                                            best_mv_y = test_mv_y
-                                            best_mv_x = test_mv_x
-            
-            mvs[i, j, 0] = best_mv_x
-            mvs[i, j, 1] = best_mv_y
-    
+                tmp    = motion_estimation(cur_frame, ref_frame, B, sr,
+                                           distance_metric)
+                int_dm = int(tmp[i, j, 0])
+                int_dn = int(tmp[i, j, 1])
+                best_dist = dist_fn(cur_block,
+                                    ref_frame[y+int_dn:y+int_dn+B,
+                                              x+int_dm:x+int_dm+B])
+
+            # Stage 2: half-pixel refinement
+            best_mv_y, best_mv_x = float(int_dn), float(int_dm)
+            for dy_h in (-0.5, 0.0, 0.5):
+                for dx_h in (-0.5, 0.0, 0.5):
+                    if dy_h == 0.0 and dx_h == 0.0:
+                        continue
+                    ty_f, tx_f = int_dn + dy_h, int_dm + dx_h
+                    # map to half-pixel grid coordinates (factor-of-2 grid)
+                    iy = int((y + ty_f) * 2)
+                    ix = int((x + tx_f) * 2)
+                    if (iy < 0 or iy + B*2 > ref_interp.shape[0] or
+                            ix < 0 or ix + B*2 > ref_interp.shape[1]):
+                        continue
+                    cand = ref_interp[iy:iy+B*2:2, ix:ix+B*2:2].astype(np.uint8)
+                    if cand.shape != (B, B):
+                        continue
+                    d = dist_fn(cur_block, cand)
+                    if d < best_dist:
+                        best_dist            = d
+                        best_mv_y, best_mv_x = ty_f, tx_f
+
+            mvs[i, j, 0] = best_mv_x   # dm (horizontal)
+            mvs[i, j, 1] = best_mv_y   # dn (vertical)
+
     return mvs
 
 
 def motion_compensation_half_pixel(ref_frame, blocksize, mvs):
     """
-    Motion compensation with half-pixel accuracy
-    
-    :param ref_frame: reference frame
-    :param blocksize: block size
-    :param mvs: motion vectors with half-pixel accuracy
-    :return: predicted frame
+    Motion compensation with half-pixel accuracy.
+
+    :param ref_frame:  reference frame
+    :param blocksize:  block side length in pixels
+    :param mvs:        half-pixel motion vectors [dm, dn]
+    :return:           predicted frame
     """
-    height, width = ref_frame.shape
+    height, width          = ref_frame.shape
+    B                      = blocksize
     num_blocks_h, num_blocks_w = mvs.shape[:2]
-    pred_frame = np.zeros((height, width), dtype=np.uint8)
-    
-    # Interpolate reference frame
-    ref_frame_interp = interpolate_half_pixel(ref_frame)
-    
+    pred_frame  = np.zeros((height, width), dtype=np.uint8)
+    ref_interp  = interpolate_half_pixel(ref_frame)
+
     for i in range(num_blocks_h):
         for j in range(num_blocks_w):
-            cur_y = i * blocksize
-            cur_x = j * blocksize
-            
-            mv_x = mvs[i, j, 0]
-            mv_y = mvs[i, j, 1]
-            
-            # Position in interpolated frame
-            ref_y_interp = int((cur_y + mv_y) * 2)
-            ref_x_interp = int((cur_x + mv_x) * 2)
-            
-            # Extract block from interpolated frame
-            ref_block = ref_frame_interp[ref_y_interp:ref_y_interp+blocksize*2:2,
-                                        ref_x_interp:ref_x_interp+blocksize*2:2]
-            
-            pred_frame[cur_y:cur_y+blocksize, cur_x:cur_x+blocksize] = ref_block.astype(np.uint8)
-    
+            y, x   = i * B, j * B
+            mv_x   = float(mvs[i, j, 0])   # dm – horizontal displacement
+            mv_y   = float(mvs[i, j, 1])   # dn – vertical   displacement
+            iy     = int((y + mv_y) * 2)
+            ix     = int((x + mv_x) * 2)
+            pred_frame[y:y+B, x:x+B] = ref_interp[iy:iy+B*2:2,
+                                                    ix:ix+B*2:2].astype(np.uint8)
     return pred_frame
 
 
 def predict_frame_half_pixel(cur_frame, ref_frame, blocksize, search_range,
                              use_three_step=True, distance_metric='ssd'):
     """
-    Prediction with half-pixel accuracy
+    Half-pixel-accurate motion-compensated prediction for one frame.
+
+    :param cur_frame: frame to be predicted
+    :param ref_frame: reference frame
+    :param blocksize: block side length in pixels
+    :param search_range:  integer-pixel search range in +-pixels
+    :param use_three_step: True = TSS for integer search, False = full search
+    :param distance_metric: 'ssd' or 'sad'
+    :return:   predicted frame
     """
-    mvs = motion_estimation_half_pixel(cur_frame, ref_frame, blocksize, search_range,
-                                       use_three_step, distance_metric)
-    pred_frame = motion_compensation_half_pixel(ref_frame, blocksize, mvs)
-    return pred_frame
+    mvs  = motion_estimation_half_pixel(cur_frame, ref_frame, blocksize,
+                                        search_range, use_three_step,
+                                        distance_metric)
+    pred = motion_compensation_half_pixel(ref_frame, blocksize, mvs)
+    return pred
